@@ -8,11 +8,17 @@
 set -euo pipefail
 
 # ---------- 配置 ----------
-readonly DISTRO_ALIAS="tabs8-debian"
+# 注意: DISTRO_ALIAS 不用 readonly, 因为旧版 proot-distro 不支持自定义 alias 时
+#       会退化到默认名 'debian', 此变量需要可改
+DISTRO_ALIAS="tabs8-debian"
 readonly DEBIAN_USER="tab"
 readonly APP_HOME="$HOME/.tabs8-linux"
 readonly BIN_DIR="$HOME/bin"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# proot-distro 的两套存储路径 (新旧版兼容)
+readonly PD_ROOT_NEW="$PREFIX/var/lib/proot-distro/containers"        # >= 4.x
+readonly PD_ROOT_OLD="$PREFIX/var/lib/proot-distro/installed-rootfs"  # legacy
 
 # ---------- 颜色输出 ----------
 c_info()  { printf '\033[1;34m[INFO]\033[0m  %s\n' "$*"; }
@@ -91,31 +97,90 @@ install_termux_deps() {
     c_ok "Termux 端依赖安装完成"
 }
 
+# ---------- 工具: 找出指定 alias 的 rootfs 路径 (兼容新旧布局) ----------
+locate_rootfs() {
+    local alias_name="$1"
+    local candidates=(
+        "$PD_ROOT_NEW/$alias_name/rootfs"   # 新版: containers/<name>/rootfs/
+        "$PD_ROOT_OLD/$alias_name"          # 旧版: installed-rootfs/<name>/
+    )
+    for cand in "${candidates[@]}"; do
+        if [ -d "$cand" ] && [ -f "$cand/etc/os-release" -o -f "$cand/etc/debian_version" ]; then
+            echo "$cand"
+            return 0
+        fi
+        # 即使没有 os-release, 只要目录存在且非空也算 (rootfs 可能尚未初始化完)
+        if [ -d "$cand" ] && [ -n "$(ls -A "$cand" 2>/dev/null)" ]; then
+            echo "$cand"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # ---------- 安装 Debian 容器 ----------
 install_debian() {
     step "[2/4] 安装 Debian 容器"
 
-    if proot-distro list --installed 2>/dev/null | grep -q "$DISTRO_ALIAS"; then
+    # 已经装好就跳过
+    if proot-distro list 2>/dev/null | grep -qw "$DISTRO_ALIAS"; then
         c_warn "容器 '$DISTRO_ALIAS' 已存在，跳过下载"
         return 0
     fi
 
-    # 用 alias 而不是默认名，方便和别的 Debian 容器共存
-    proot-distro install debian --override-alias "$DISTRO_ALIAS"
+    # 探测 proot-distro 命令风格
+    local install_help
+    install_help="$(proot-distro install --help 2>&1 || true)"
 
-    c_ok "Debian 容器安装完成"
+    if echo "$install_help" | grep -q -- '--name'; then
+        # 新版 (>= 4.x): 用 --name 起 alias
+        c_info "使用新版 proot-distro 命令: install debian --name $DISTRO_ALIAS"
+        proot-distro install debian --name "$DISTRO_ALIAS"
+
+    elif echo "$install_help" | grep -q -- '--override-alias'; then
+        # 旧版: 用 --override-alias 起 alias
+        c_info "使用旧版 proot-distro 命令: install debian --override-alias $DISTRO_ALIAS"
+        proot-distro install debian --override-alias "$DISTRO_ALIAS"
+
+    else
+        # 极个别版本既不支持也不识别, 退化为默认 alias 'debian'
+        c_warn "你的 proot-distro 既不支持 --name 也不支持 --override-alias"
+        c_warn "退化为默认 alias = 'debian' (会和你已有的 debian 容器共用)"
+        if proot-distro list 2>/dev/null | grep -qw "debian"; then
+            c_warn "已有 'debian' 容器, 复用 (将在其上叠加 XFCE 配置)"
+            read -rp "继续？(yes/N) " ans
+            [ "$ans" = "yes" ] || exit 1
+        else
+            proot-distro install debian
+        fi
+        DISTRO_ALIAS="debian"
+    fi
+
+    c_ok "Debian 容器安装完成 (alias=$DISTRO_ALIAS)"
 }
 
 # ---------- 在 Debian 内执行配置 ----------
 configure_debian() {
     step "[3/4] 配置 Debian (XFCE + 中文 + 用户)"
 
-    local rootfs="$PREFIX/var/lib/proot-distro/installed-rootfs/$DISTRO_ALIAS"
-
-    if [ ! -d "$rootfs" ]; then
-        c_err "未找到 rootfs: $rootfs"
+    local rootfs
+    if ! rootfs="$(locate_rootfs "$DISTRO_ALIAS")"; then
+        c_err "未找到 rootfs. 已检查的位置:"
+        c_err "  - $PD_ROOT_NEW/$DISTRO_ALIAS/rootfs   (新版布局)"
+        c_err "  - $PD_ROOT_OLD/$DISTRO_ALIAS          (旧版布局)"
+        c_err ""
+        c_err "诊断信息: proot-distro list 输出"
+        proot-distro list 2>&1 | sed 's/^/    /' >&2 || true
+        c_err ""
+        c_err "可能的修复:"
+        c_err "  1) 容器装到了别名 'debian' 而非 '$DISTRO_ALIAS'"
+        c_err "     -> proot-distro rename debian $DISTRO_ALIAS    (新版有 rename)"
+        c_err "     -> 或: proot-distro remove debian; 重跑 install.sh"
+        c_err "  2) 上一步 proot-distro install 实际失败了"
+        c_err "     -> 重跑: proot-distro install debian --name $DISTRO_ALIAS"
         exit 1
     fi
+    c_info "rootfs 位置: $rootfs"
 
     # 拷贝配置脚本到容器内 /root/
     cp "$SCRIPT_DIR/lib/debian-setup.sh" "$rootfs/root/setup.sh"

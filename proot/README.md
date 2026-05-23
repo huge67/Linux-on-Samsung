@@ -122,6 +122,7 @@ sudo apt update
 | 现象 | 原因 / 解决 |
 |---|---|
 | 安装时 `Unable to locate package termux-x11-nightly` | `x11-repo` 加上后 apt 索引没刷新。手动修: `pkg install -y x11-repo && pkg update -y && pkg install -y termux-x11-nightly`。如仍失败, 检查 Termux 是否来自 F-Droid（Google Play 版已废弃） |
+| 安装到 [3/4] 报 `未找到 rootfs` | 你的 proot-distro 是新版 (>= 4.x), 容器存到了 `containers/<name>/rootfs/` 而不是 `installed-rootfs/<name>/`。最新脚本已兼容。如还失败: 看 `proot-distro list` 实际 alias, 用 `proot-distro rename <现名> tabs8-debian` 改名后重跑 install.sh |
 | `tabs8-start` 后 X11 一直黑屏 | 检查 Termux:X11 应用是否安装、是否被电池优化杀掉 |
 | 启动后 XFCE 闪退 | 容器没共享 `/tmp`，确认用的是脚本里的 `--shared-tmp` |
 | 中文显示成方块 | 字体没装好，进容器执行 `sudo apt install -y fonts-noto-cjk` |
