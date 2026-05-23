@@ -56,12 +56,15 @@ c_info "进入 Debian 容器并启动 XFCE..."
 echo
 echo "  提示: 桌面运行后, 在 Termux:X11 应用窗口中查看"
 echo "  关闭桌面: 在新的 Termux 会话执行 'tabs8-stop'"
+echo "  排查黑屏: 看日志 ~/.tabs8-xfce.log (容器内 $DEBIAN_USER 家目录)"
 echo
 
-# --shared-tmp: 让 Debian 容器和 Termux 共享 /tmp
-#               这样 PulseAudio 套接字 (如果有) 可见, 也方便文件传递
+# --shared-tmp: host $PREFIX/tmp -> container /tmp
+# --shared-x11: host $PREFIX/tmp/.X11-unix -> container /tmp/.X11-unix
+#               (新版 proot-distro 必须显式声明, 否则容器看不到 X socket)
 # --user:       以普通用户身份登录, 而不是 root
 exec proot-distro login "$DISTRO_ALIAS" \
     --user "$DEBIAN_USER" \
     --shared-tmp \
+    --shared-x11 \
     -- bash -lc "/home/$DEBIAN_USER/.local/bin/xstartup"
