@@ -122,9 +122,10 @@ locate_rootfs() {
 install_debian() {
     step "[2/4] 安装 Debian 容器"
 
-    # 已经装好就跳过
-    if proot-distro list 2>/dev/null | grep -qw "$DISTRO_ALIAS"; then
-        c_warn "容器 '$DISTRO_ALIAS' 已存在，跳过下载"
+    # 容器是否已存在: 直接检查 rootfs (比解析 'proot-distro list' 输出更可靠,
+    # 后者可能带 ANSI 颜色码或表格格式干扰)
+    if locate_rootfs "$DISTRO_ALIAS" >/dev/null 2>&1; then
+        c_warn "容器 '$DISTRO_ALIAS' 已存在, 跳过下载"
         return 0
     fi
 
@@ -132,28 +133,46 @@ install_debian() {
     local install_help
     install_help="$(proot-distro install --help 2>&1 || true)"
 
+    local install_rc=0
+    local install_output=""
+
     if echo "$install_help" | grep -q -- '--name'; then
         # 新版 (>= 4.x): 用 --name 起 alias
         c_info "使用新版 proot-distro 命令: install debian --name $DISTRO_ALIAS"
-        proot-distro install debian --name "$DISTRO_ALIAS"
+        install_output="$(proot-distro install debian --name "$DISTRO_ALIAS" 2>&1)" || install_rc=$?
 
     elif echo "$install_help" | grep -q -- '--override-alias'; then
         # 旧版: 用 --override-alias 起 alias
         c_info "使用旧版 proot-distro 命令: install debian --override-alias $DISTRO_ALIAS"
-        proot-distro install debian --override-alias "$DISTRO_ALIAS"
+        install_output="$(proot-distro install debian --override-alias "$DISTRO_ALIAS" 2>&1)" || install_rc=$?
 
     else
         # 极个别版本既不支持也不识别, 退化为默认 alias 'debian'
         c_warn "你的 proot-distro 既不支持 --name 也不支持 --override-alias"
         c_warn "退化为默认 alias = 'debian' (会和你已有的 debian 容器共用)"
-        if proot-distro list 2>/dev/null | grep -qw "debian"; then
+        DISTRO_ALIAS="debian"
+        if locate_rootfs "$DISTRO_ALIAS" >/dev/null 2>&1; then
             c_warn "已有 'debian' 容器, 复用 (将在其上叠加 XFCE 配置)"
             read -rp "继续？(yes/N) " ans
             [ "$ans" = "yes" ] || exit 1
         else
-            proot-distro install debian
+            install_output="$(proot-distro install debian 2>&1)" || install_rc=$?
         fi
-        DISTRO_ALIAS="debian"
+    fi
+
+    # 输出转发给用户看 (不管成功失败)
+    if [ -n "$install_output" ]; then
+        echo "$install_output"
+    fi
+
+    # 兜底: install 失败但提示 "已存在" 时不算错, 复用即可
+    if [ "$install_rc" -ne 0 ]; then
+        if echo "$install_output" | grep -qiE 'already exists|already installed'; then
+            c_warn "proot-distro 报告容器已存在, 复用: $DISTRO_ALIAS"
+        else
+            c_err "proot-distro install 失败 (exit=$install_rc)"
+            exit "$install_rc"
+        fi
     fi
 
     c_ok "Debian 容器安装完成 (alias=$DISTRO_ALIAS)"
