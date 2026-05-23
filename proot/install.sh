@@ -61,15 +61,32 @@ install_termux_deps() {
     pkg update -y
     pkg upgrade -y
 
-    # 必装包
+    # 1) x11-repo 必须先单独安装并 pkg update, 否则 apt 索引看不到 termux-x11-nightly
+    c_info "添加 x11-repo (Termux:X11 所在仓库)"
+    pkg install -y x11-repo
+    pkg update -y
+
+    # 2) 主仓库的依赖
+    c_info "安装核心依赖 (proot-distro / pulseaudio / termux-api)"
     pkg install -y \
         proot-distro \
         pulseaudio \
-        x11-repo \
-        termux-x11-nightly \
         termux-api \
         curl \
         wget
+
+    # 3) Termux:X11 单独装, 失败时给出可执行的修复提示
+    c_info "安装 Termux:X11 服务器 (termux-x11-nightly)"
+    if ! pkg install -y termux-x11-nightly; then
+        c_err "termux-x11-nightly 安装失败. 可能原因:"
+        c_err "  1) Termux 来自 Google Play (已废弃, 包源停更)"
+        c_err "     -> 卸载后从 F-Droid 重装: https://f-droid.org/packages/com.termux/"
+        c_err "  2) 网络问题导致 x11-repo 索引未拉取"
+        c_err "     -> 配好代理后, 手动: pkg update && pkg install termux-x11-nightly"
+        c_err "  3) 架构不支持 (本包仅 aarch64/arm)"
+        c_err "     -> 当前架构: $(dpkg --print-architecture 2>/dev/null || echo unknown)"
+        exit 1
+    fi
 
     c_ok "Termux 端依赖安装完成"
 }
