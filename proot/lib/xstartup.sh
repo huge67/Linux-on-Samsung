@@ -2,51 +2,60 @@
 # ============================================================
 # 在 Debian 容器内启动 XFCE4 桌面 (手动逐组件)
 #
-# 不使用 startxfce4 wrapper, 也不用 'dbus-launch --exit-with-session':
-# 这套组合在 proot 容器里会因为 logind 缺失 / dbus 嵌套导致
-# xfce4-session daemonize 后整条链立即退出, 表现为黑屏.
-#
-# 改为:
-#   1) 用 'dbus-launch --sh-syntax' 启动 dbus session daemon
-#   2) 顺序启动 xfwm4 / xfsettingsd / xfdesktop / xfce4-panel
-#   3) wait 在 xfwm4 上, 这样桌面退出时主脚本才退出
+# 关键设计点 (一路趟坑攒的经验):
+#   1) 启动前清理残留进程 - 上次会话没退干净时,
+#      旧的 xfdesktop / dbus-daemon 会占用根窗口,
+#      新启动的 panel 创建的窗口会被覆盖, 看起来像 panel 没出现
+#   2) 不用 startxfce4 wrapper, 不用 dbus-launch --exit-with-session
+#      (proot 容器无 logind, 嵌套 dbus 会让 xfce4-session 立即退出)
+#   3) xfwm4 必须禁用合成器 (proot 无 GPU, 合成器输出空 framebuffer)
+#   4) xfdesktop 配置预写, 不用 xfconf-query 后处理 (会卡住)
+#   5) xfce4-panel 用极简配置, 不 cp /etc/xdg 的 default.xml
+#      (default 含 systray/indicator 等 plugin, 在 proot 加载失败导致
+#      panel 启动后立即退出)
+#   6) 启动末尾跑 xrefresh 触发 Termux:X11 重绘
 # ============================================================
 
 LOG="$HOME/.tabs8-xfce.log"
 TMP_LOG="/tmp/tabs8-xfce.log"
-
-# 同时写到家目录和共享 /tmp, 方便从 Termux 端 cat
 exec > >(tee "$LOG" "$TMP_LOG") 2>&1
 
 echo "===== XFCE startup at $(date '+%F %T') ====="
 echo "User : $(whoami) (uid=$(id -u))"
 echo "Home : $HOME"
 
-# ---------- 环境变量 ----------
+# ---------- 0. 清理上次会话残留 ----------
+# stop.sh 不一定每次都把容器内进程清干净 (用户直接关 Termux 等情况).
+# 旧的 xfdesktop / dbus 占用根窗口时, 新会话画的内容会被它们覆盖.
+echo "--- 清理可能存在的残留进程 ---"
+pkill -9 -f 'xfwm4|xfdesktop|xfce4-panel|xfsettingsd|xfconfd' 2>/dev/null
+pkill -9 -f 'dbus-daemon|dbus-launch'                         2>/dev/null
+sleep 2
+echo "  清理后剩余 XFCE/dbus 进程:"
+pgrep -af 'xfwm|xfdesktop|xfce4-|xfsettings|dbus|xfconf' 2>/dev/null \
+    | head -5 || echo "  (无, 干净)"
+
+# ---------- 1. 环境变量 ----------
 export DISPLAY=:0
 export PULSE_SERVER=tcp:127.0.0.1:4713
 export XDG_RUNTIME_DIR="/tmp/runtime-$(id -u)"
-mkdir -p "$XDG_RUNTIME_DIR"
-chmod 700 "$XDG_RUNTIME_DIR"
+mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
 
 export XDG_SESSION_TYPE=x11
 export GDK_BACKEND=x11
 export QT_QPA_PLATFORM=xcb
 export _JAVA_AWT_WM_NONREPARENTING=1
 
-# 中文 locale (前提是 setup 时 locale-gen 过)
 export LANG=zh_CN.UTF-8
 export LC_ALL=zh_CN.UTF-8
 
-# ---------- 关键: 禁用 xfwm4 合成器 ----------
-# proot 容器没真正的 GPU 加速, OpenGL 合成器输出空 framebuffer = 黑屏
-# (xfwm4 进程仍活着, 但屏幕全黑, 是 termux-x11 + xfwm4 最经典的坑)
-echo "--- 写入 xfwm4 配置 (禁用合成器) ---"
 XFCONF_DIR="$HOME/.config/xfce4/xfconf/xfce-perchannel-xml"
 mkdir -p "$XFCONF_DIR"
+
+# ---------- 2. xfwm4 配置 (禁用合成器) ----------
+echo "--- 写 xfwm4 配置 ---"
 cat > "$XFCONF_DIR/xfwm4.xml" <<'XML'
 <?xml version="1.0" encoding="UTF-8"?>
-
 <channel name="xfwm4" version="1.0">
   <property name="general" type="empty">
     <property name="use_compositing" type="bool" value="false"/>
@@ -56,179 +65,160 @@ cat > "$XFCONF_DIR/xfwm4.xml" <<'XML'
   </property>
 </channel>
 XML
-echo "  写入: $XFCONF_DIR/xfwm4.xml"
-# ---------- 自检 ----------
-echo "--- env (筛选) ---"
-env | grep -E '^(DISPLAY|XDG_|LANG|LC_|PULSE_|DBUS_)' | sort
 
-echo "--- X11 socket (/tmp/.X11-unix) ---"
-ls -la /tmp/.X11-unix/ 2>&1 | head -5 || echo "  目录不存在!"
+# ---------- 3. xfdesktop 配置 (纯色背景, 用 xrandr 取 monitor name) ----------
+MONITOR_NAME=$(xrandr 2>/dev/null | awk '/ connected/ {print $1; exit}')
+MONITOR_NAME=${MONITOR_NAME:-screen}
+echo "--- 写 xfdesktop 配置 (monitor: monitor${MONITOR_NAME}) ---"
+cat > "$XFCONF_DIR/xfce4-desktop.xml" <<XML
+<?xml version="1.0" encoding="UTF-8"?>
+<channel name="xfce4-desktop" version="1.0">
+  <property name="backdrop" type="empty">
+    <property name="screen0" type="empty">
+      <property name="monitor${MONITOR_NAME}" type="empty">
+        <property name="workspace0" type="empty">
+          <property name="color-style" type="int" value="0"/>
+          <property name="image-style" type="int" value="0"/>
+          <property name="last-image" type="string" value=""/>
+          <property name="color1" type="array">
+            <value type="double" value="0.227"/>
+            <value type="double" value="0.251"/>
+            <value type="double" value="0.333"/>
+            <value type="double" value="1.000"/>
+          </property>
+        </property>
+      </property>
+    </property>
+  </property>
+</channel>
+XML
 
-echo "--- 关键命令是否就绪 ---"
-ALL_OK=1
-for cmd in dbus-launch dbus-daemon xfwm4 xfsettingsd xfdesktop xfce4-panel xset; do
-    if command -v "$cmd" >/dev/null 2>&1; then
-        printf '  %-20s OK  (%s)\n' "$cmd" "$(command -v "$cmd")"
-    else
-        printf '  %-20s MISSING\n' "$cmd"
-        ALL_OK=0
-    fi
-done
-if [ "$ALL_OK" -eq 0 ]; then
-    echo "  >> 缺少组件, 请进容器执行: sudo apt install -y xfce4 xfce4-terminal dbus-x11"
-fi
-
-echo "--- X server 连通性 (xset q) ---"
-if ! xset q 2>&1 | head -3; then
-    echo "  >> X 连接失败. 检查 termux-x11 / Termux:X11 应用"
-    exit 1
-fi
-
-# ---------- 启动 dbus session daemon ----------
-# --sh-syntax: 输出 'export DBUS_SESSION_BUS_ADDRESS=...; export DBUS_SESSION_BUS_PID=...'
-# eval 把变量导入当前 shell, 后续子进程继承
-echo "--- 启动 dbus-launch (session) ---"
-if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
-    DBUS_LAUNCH_OUT="$(dbus-launch --sh-syntax 2>&1)"
-    if [ $? -ne 0 ] || ! echo "$DBUS_LAUNCH_OUT" | grep -q DBUS_SESSION_BUS_ADDRESS; then
-        echo "  >> dbus-launch 失败:"
-        echo "$DBUS_LAUNCH_OUT"
-        exit 1
-    fi
-    eval "$DBUS_LAUNCH_OUT"
-    echo "  DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS"
-    echo "  DBUS_SESSION_BUS_PID=$DBUS_SESSION_BUS_PID"
-    # 记录 PID 给 stop.sh 用
-    echo "$DBUS_SESSION_BUS_PID" > "$XDG_RUNTIME_DIR/tabs8-dbus.pid"
-fi
-
-# ---------- 顺序启动 XFCE 组件 ----------
-echo "--- 启动 XFCE 组件 ---"
-
-# 在 xfwm4 接管前, 先把根窗口染色, 提供视觉反馈
-# (如果 Termux:X11 窗口能看到这个颜色, 说明 X 渲染本身没问题)
-xsetroot -solid '#3a4055' 2>/dev/null || true
-
-echo "[start] xfwm4 --replace --compositor=off"
-# --compositor=off: 命令行强制关合成器, 双保险 (xfwm4 4.16+)
-xfwm4 --replace --compositor=off 2>&1 &
-WMPID=$!
-sleep 2
-
-echo "[start] xfsettingsd"
-xfsettingsd 2>&1 &
-sleep 1
-
-echo "[start] xfdesktop"
-xfdesktop 2>&1 &
-sleep 2
-
-# xfdesktop 启动后, 它会在 xfconf 注册当前 monitor 配置.
-# Debian 默认壁纸路径在 'xfdesktop4-data' 包里, 我们没装 (--no-install-recommends),
-# xfdesktop 找不到图片, 默认会画黑色 -> 桌面全黑.
-# 解决: 枚举所有已注册的 monitor, 改成纯色背景, 不依赖任何图片.
-echo "--- 强制 xfdesktop 纯色背景 (避免壁纸找不到导致黑屏) ---"
-MONS=$(xfconf-query -c xfce4-desktop -l 2>/dev/null \
-    | grep -oE '/backdrop/screen0/monitor[^/]+' \
-    | sed 's|/backdrop/screen0/||' | sort -u)
-if [ -z "$MONS" ]; then
-    # xfdesktop 还没注册 (太快), 用 xrandr 兜底
-    XRANDR_NAME=$(xrandr 2>/dev/null | awk '/ connected/ {print $1; exit}')
-    MONS="monitor${XRANDR_NAME:-screen}"
-    echo "  (xfconf 中无 monitor, 从 xrandr 推断: $MONS)"
-fi
-for mon in $MONS; do
-    BASE="/backdrop/screen0/$mon/workspace0"
-    echo "  -> $mon"
-    xfconf-query -c xfce4-desktop -p "$BASE/color-style" -t int -s 0 --create 2>/dev/null
-    xfconf-query -c xfce4-desktop -p "$BASE/image-style" -t int -s 0 --create 2>/dev/null
-    xfconf-query -c xfce4-desktop -p "$BASE/last-image" -t string -s "" --create 2>/dev/null
-    xfconf-query -c xfce4-desktop -p "$BASE/color1" \
-        -t double -t double -t double -t double \
-        -s 0.227 -s 0.251 -s 0.333 -s 1.0 --create 2>/dev/null
-done
-xfdesktop --reload 2>/dev/null || true
-
-# Panel 第一次启动会弹欢迎对话框 (Use default / One empty / Migrate);
-# 在 Termux:X11 上对话框可能不在前台, 导致用户以为 panel 根本没起来.
-# 预先把 Debian 默认 panel 配置 cp 到用户配置目录, 跳过对话框.
-echo "--- 准备 xfce4-panel 配置 (跳过欢迎对话框) ---"
-PANEL_CFG="$XFCONF_DIR/xfce4-panel.xml"
-if [ ! -s "$PANEL_CFG" ]; then
-    if [ -f /etc/xdg/xfce4/panel/default.xml ]; then
-        cp /etc/xdg/xfce4/panel/default.xml "$PANEL_CFG"
-        echo "  从 /etc/xdg/xfce4/panel/default.xml 拷贝"
-    else
-        echo "  /etc/xdg 默认配置缺失, 写最小配置"
-        cat > "$PANEL_CFG" <<'XML'
+# ---------- 4. xfce4-panel 配置 (强制极简) ----------
+# 不 cp /etc/xdg/xfce4/panel/default.xml — 那个对 proot 太复杂
+# (含 systray / indicator-plugin / status-notifier 等 plugin
+# 在容器里因缺少对应 dbus 服务而加载失败, 导致 panel 启动后立即退出)
+echo "--- 写 xfce4-panel 配置 (极简: 菜单/任务列表/分隔/时钟) ---"
+cat > "$XFCONF_DIR/xfce4-panel.xml" <<'XML'
 <?xml version="1.0" encoding="UTF-8"?>
 <channel name="xfce4-panel" version="1.0">
   <property name="configver" type="int" value="2"/>
   <property name="panels" type="array">
     <value type="int" value="1"/>
     <property name="panel-1" type="empty">
-      <property name="position" type="string" value="p=8;x=0;y=0"/>
+      <property name="position" type="string" value="p=7;x=0;y=0"/>
       <property name="length" type="uint" value="100"/>
-      <property name="size" type="uint" value="36"/>
+      <property name="size" type="uint" value="40"/>
       <property name="position-locked" type="bool" value="true"/>
       <property name="plugin-ids" type="array">
         <value type="int" value="1"/>
         <value type="int" value="2"/>
         <value type="int" value="3"/>
         <value type="int" value="4"/>
-        <value type="int" value="5"/>
       </property>
     </property>
   </property>
   <property name="plugins" type="empty">
     <property name="plugin-1" type="string" value="applicationsmenu"/>
-    <property name="plugin-2" type="string" value="tasklist"/>
+    <property name="plugin-2" type="string" value="tasklist">
+      <property name="show-handle" type="bool" value="false"/>
+    </property>
     <property name="plugin-3" type="string" value="separator">
       <property name="expand" type="bool" value="true"/>
       <property name="style" type="uint" value="0"/>
     </property>
-    <property name="plugin-4" type="string" value="systray"/>
-    <property name="plugin-5" type="string" value="clock"/>
+    <property name="plugin-4" type="string" value="clock">
+      <property name="digital-format" type="string" value="%H:%M"/>
+    </property>
   </property>
 </channel>
 XML
+
+# ---------- 5. 自检 ----------
+echo "--- 自检 ---"
+echo "  X11 socket:"
+ls -la /tmp/.X11-unix/ 2>&1 | head -5
+
+for cmd in dbus-launch xfwm4 xfsettingsd xfdesktop xfce4-panel xset xrefresh; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+        printf '  %-15s OK\n' "$cmd"
+    else
+        printf '  %-15s MISSING\n' "$cmd"
     fi
-else
-    echo "  $PANEL_CFG 已存在, 跳过"
-fi
+done
 
-echo "[start] xfce4-panel"
-xfce4-panel 2>&1 &
-sleep 2
-
-echo "--- 进程列表 (XFCE) ---"
-ps -eo pid,comm 2>/dev/null | grep -E 'xfwm|xfdesktop|xfce4-|xfsettings|dbus' \
-    | grep -v grep || echo "  (没有 xfce 相关进程, 启动失败)"
-
-# 检查窗口管理器是否还活着
-if ! kill -0 "$WMPID" 2>/dev/null; then
-    echo "  >> xfwm4 已死 (PID $WMPID 不存在)"
-    echo "  >> 请检查日志中 [start] xfwm4 后面是否有错误信息"
+if ! xset q >/dev/null 2>&1; then
+    echo "  >> X 连接失败. termux-x11 / Termux:X11 应用没起来"
     exit 1
 fi
+echo "  X 连接 OK"
+
+# ---------- 6. 启动 dbus session daemon ----------
+echo "--- 启动 dbus-launch (session) ---"
+DBUS_LAUNCH_OUT="$(dbus-launch --sh-syntax 2>&1)"
+if [ $? -ne 0 ] || ! echo "$DBUS_LAUNCH_OUT" | grep -q DBUS_SESSION_BUS_ADDRESS; then
+    echo "  >> dbus-launch 失败: $DBUS_LAUNCH_OUT"
+    exit 1
+fi
+eval "$DBUS_LAUNCH_OUT"
+echo "  DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS"
+echo "  DBUS_SESSION_BUS_PID=$DBUS_SESSION_BUS_PID"
+echo "$DBUS_SESSION_BUS_PID" > "$XDG_RUNTIME_DIR/tabs8-dbus.pid"
+
+# ---------- 7. 顺序启动 XFCE 组件 ----------
+echo "--- 启动 XFCE 组件 ---"
+
+# 启动序列开始前先把根窗口染成预期颜色 (如果后面 xfdesktop 异常,
+# 至少不是黑屏, 可以肉眼分辨"组件起来没")
+xsetroot -solid '#3a4055' 2>/dev/null || true
+sleep 1
+
+echo "[1] xfwm4 --replace --compositor=off"
+xfwm4 --replace --compositor=off 2>&1 &
+WMPID=$!
+sleep 3
+
+echo "[2] xfsettingsd"
+xfsettingsd 2>&1 &
+sleep 2
+
+echo "[3] xfdesktop"
+xfdesktop 2>&1 &
+sleep 3
+
+echo "[4] xfce4-panel"
+xfce4-panel 2>&1 &
+sleep 3
+
+# ---------- 8. 状态检查 ----------
+echo "--- 进程列表 ---"
+pgrep -af 'xfwm|xfdesktop|xfce4-panel|xfsettingsd|dbus-daemon' | head -10
+
+echo "--- X 窗口列表 (panel 应该在这里) ---"
+xwininfo -root -tree 2>&1 | grep -E '(panel|xfwm|xfdesktop|0x[0-9a-f]+)' \
+    | head -10 || echo "  (xwininfo 无输出, 可能未装 x11-utils)"
+
+if ! kill -0 "$WMPID" 2>/dev/null; then
+    echo "  >> xfwm4 已死, 桌面无窗口管理器, 退出"
+    exit 1
+fi
+
+# ---------- 9. 强制刷新 (Termux:X11 首次连接需要触发重绘) ----------
+xrefresh 2>/dev/null || true
+xsetroot -solid '#3a4055' 2>/dev/null || true
 
 echo
 echo "===== XFCE 桌面已启动 ($(date '+%T')) ====="
 echo "切到 Termux:X11 应用窗口查看桌面"
-echo "正在等待 xfwm4 (PID $WMPID) 退出 ..."
+echo "等待 xfwm4 (PID $WMPID) 退出..."
 echo
 
-# wait 在窗口管理器上, 它退出代表桌面会话结束
 wait "$WMPID" 2>/dev/null || true
 
 echo "===== xfwm4 退出 ($(date '+%T')), 清理 ====="
+pkill -TERM -f 'xfdesktop|xfce4-panel|xfsettingsd' 2>/dev/null || true
+sleep 1
+pkill -KILL -f 'xfdesktop|xfce4-panel|xfsettingsd' 2>/dev/null || true
 
-# 清理其他组件
-pkill -TERM -f xfdesktop    2>/dev/null || true
-pkill -TERM -f xfce4-panel  2>/dev/null || true
-pkill -TERM -f xfsettingsd  2>/dev/null || true
-
-# 关掉 dbus session daemon
 if [ -n "${DBUS_SESSION_BUS_PID:-}" ]; then
     kill "$DBUS_SESSION_BUS_PID" 2>/dev/null || true
 fi
