@@ -57,7 +57,6 @@ cat > "$XFCONF_DIR/xfwm4.xml" <<'XML'
 </channel>
 XML
 echo "  写入: $XFCONF_DIR/xfwm4.xml"
-
 # ---------- 自检 ----------
 echo "--- env (筛选) ---"
 env | grep -E '^(DISPLAY|XDG_|LANG|LC_|PULSE_|DBUS_)' | sort
@@ -122,7 +121,33 @@ sleep 1
 
 echo "[start] xfdesktop"
 xfdesktop 2>&1 &
-sleep 1
+sleep 2
+
+# xfdesktop 启动后, 它会在 xfconf 注册当前 monitor 配置.
+# Debian 默认壁纸路径在 'xfdesktop4-data' 包里, 我们没装 (--no-install-recommends),
+# xfdesktop 找不到图片, 默认会画黑色 -> 桌面全黑.
+# 解决: 枚举所有已注册的 monitor, 改成纯色背景, 不依赖任何图片.
+echo "--- 强制 xfdesktop 纯色背景 (避免壁纸找不到导致黑屏) ---"
+MONS=$(xfconf-query -c xfce4-desktop -l 2>/dev/null \
+    | grep -oE '/backdrop/screen0/monitor[^/]+' \
+    | sed 's|/backdrop/screen0/||' | sort -u)
+if [ -z "$MONS" ]; then
+    # xfdesktop 还没注册 (太快), 用 xrandr 兜底
+    XRANDR_NAME=$(xrandr 2>/dev/null | awk '/ connected/ {print $1; exit}')
+    MONS="monitor${XRANDR_NAME:-screen}"
+    echo "  (xfconf 中无 monitor, 从 xrandr 推断: $MONS)"
+fi
+for mon in $MONS; do
+    BASE="/backdrop/screen0/$mon/workspace0"
+    echo "  -> $mon"
+    xfconf-query -c xfce4-desktop -p "$BASE/color-style" -t int -s 0 --create 2>/dev/null
+    xfconf-query -c xfce4-desktop -p "$BASE/image-style" -t int -s 0 --create 2>/dev/null
+    xfconf-query -c xfce4-desktop -p "$BASE/last-image" -t string -s "" --create 2>/dev/null
+    xfconf-query -c xfce4-desktop -p "$BASE/color1" \
+        -t double -t double -t double -t double \
+        -s 0.227 -s 0.251 -s 0.333 -s 1.0 --create 2>/dev/null
+done
+xfdesktop --reload 2>/dev/null || true
 
 echo "[start] xfce4-panel"
 xfce4-panel 2>&1 &
