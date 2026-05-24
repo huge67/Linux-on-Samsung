@@ -38,6 +38,26 @@ export _JAVA_AWT_WM_NONREPARENTING=1
 export LANG=zh_CN.UTF-8
 export LC_ALL=zh_CN.UTF-8
 
+# ---------- 关键: 禁用 xfwm4 合成器 ----------
+# proot 容器没真正的 GPU 加速, OpenGL 合成器输出空 framebuffer = 黑屏
+# (xfwm4 进程仍活着, 但屏幕全黑, 是 termux-x11 + xfwm4 最经典的坑)
+echo "--- 写入 xfwm4 配置 (禁用合成器) ---"
+XFCONF_DIR="$HOME/.config/xfce4/xfconf/xfce-perchannel-xml"
+mkdir -p "$XFCONF_DIR"
+cat > "$XFCONF_DIR/xfwm4.xml" <<'XML'
+<?xml version="1.0" encoding="UTF-8"?>
+
+<channel name="xfwm4" version="1.0">
+  <property name="general" type="empty">
+    <property name="use_compositing" type="bool" value="false"/>
+    <property name="theme" type="string" value="Default"/>
+    <property name="title_font" type="string" value="Sans Bold 9"/>
+    <property name="button_layout" type="string" value="O|HMC"/>
+  </property>
+</channel>
+XML
+echo "  写入: $XFCONF_DIR/xfwm4.xml"
+
 # ---------- 自检 ----------
 echo "--- env (筛选) ---"
 env | grep -E '^(DISPLAY|XDG_|LANG|LC_|PULSE_|DBUS_)' | sort
@@ -86,8 +106,13 @@ fi
 # ---------- 顺序启动 XFCE 组件 ----------
 echo "--- 启动 XFCE 组件 ---"
 
-echo "[start] xfwm4 --replace"
-xfwm4 --replace 2>&1 &
+# 在 xfwm4 接管前, 先把根窗口染色, 提供视觉反馈
+# (如果 Termux:X11 窗口能看到这个颜色, 说明 X 渲染本身没问题)
+xsetroot -solid '#3a4055' 2>/dev/null || true
+
+echo "[start] xfwm4 --replace --compositor=off"
+# --compositor=off: 命令行强制关合成器, 双保险 (xfwm4 4.16+)
+xfwm4 --replace --compositor=off 2>&1 &
 WMPID=$!
 sleep 2
 
