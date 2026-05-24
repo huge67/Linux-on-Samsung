@@ -149,6 +149,54 @@ for mon in $MONS; do
 done
 xfdesktop --reload 2>/dev/null || true
 
+# Panel 第一次启动会弹欢迎对话框 (Use default / One empty / Migrate);
+# 在 Termux:X11 上对话框可能不在前台, 导致用户以为 panel 根本没起来.
+# 预先把 Debian 默认 panel 配置 cp 到用户配置目录, 跳过对话框.
+echo "--- 准备 xfce4-panel 配置 (跳过欢迎对话框) ---"
+PANEL_CFG="$XFCONF_DIR/xfce4-panel.xml"
+if [ ! -s "$PANEL_CFG" ]; then
+    if [ -f /etc/xdg/xfce4/panel/default.xml ]; then
+        cp /etc/xdg/xfce4/panel/default.xml "$PANEL_CFG"
+        echo "  从 /etc/xdg/xfce4/panel/default.xml 拷贝"
+    else
+        echo "  /etc/xdg 默认配置缺失, 写最小配置"
+        cat > "$PANEL_CFG" <<'XML'
+<?xml version="1.0" encoding="UTF-8"?>
+<channel name="xfce4-panel" version="1.0">
+  <property name="configver" type="int" value="2"/>
+  <property name="panels" type="array">
+    <value type="int" value="1"/>
+    <property name="panel-1" type="empty">
+      <property name="position" type="string" value="p=8;x=0;y=0"/>
+      <property name="length" type="uint" value="100"/>
+      <property name="size" type="uint" value="36"/>
+      <property name="position-locked" type="bool" value="true"/>
+      <property name="plugin-ids" type="array">
+        <value type="int" value="1"/>
+        <value type="int" value="2"/>
+        <value type="int" value="3"/>
+        <value type="int" value="4"/>
+        <value type="int" value="5"/>
+      </property>
+    </property>
+  </property>
+  <property name="plugins" type="empty">
+    <property name="plugin-1" type="string" value="applicationsmenu"/>
+    <property name="plugin-2" type="string" value="tasklist"/>
+    <property name="plugin-3" type="string" value="separator">
+      <property name="expand" type="bool" value="true"/>
+      <property name="style" type="uint" value="0"/>
+    </property>
+    <property name="plugin-4" type="string" value="systray"/>
+    <property name="plugin-5" type="string" value="clock"/>
+  </property>
+</channel>
+XML
+    fi
+else
+    echo "  $PANEL_CFG 已存在, 跳过"
+fi
+
 echo "[start] xfce4-panel"
 xfce4-panel 2>&1 &
 sleep 2
